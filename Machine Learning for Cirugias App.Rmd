@@ -1,0 +1,387 @@
+---
+title: "Machine Learning for Cirugias App"
+author: "Josué Jiménez Vázquez"
+date: "27/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("packs_and_libs.R")
+source("functions.R")
+source("data_wrangle.R")
+
+```
+
+Este documento R Markdown contiene el análisis y desarrollo de los algoritmos de machine learning para la aplicación “Cirugías Predictor”
+Se harán dos algoritmos, uno será para predecir si se necesitan procedimientos y el otro será para predecir cuantos procedimientos necesita. 
+
+Primero se hará el algoritmo para la predicción por años y si se necesitan procedimientos. Se tomará solamente las enfermedades que han tenido 5 o más pacientes. También, se creara la columna para determinar si se necesitan o no procedimientos. 
+
+```{r}
+
+CIE10_5mas <- CIE10 %>% filter(n >= 5)
+cirugias_set <- cirugias_set %>% filter(CIE10 %in% CIE10_5mas$CIE10)
+CIE10_y_f <- CIE10_5y %>% select(CIE10, factor)
+
+
+cirugias_set_a <- cirugias_set %>% filter(TiempoEdad == "AÑOS") %>%
+                select(EDAD, SEXO, CIE10, N_CIE9) %>%
+                mutate(masde1 = ifelse(N_CIE9 == 0, 0, 1))
+
+```
+
+Se probara un árbol de decisión. Para esto es necesario cambiar las variables categóricas a factores numéricos. 
+
+```{r}
+cirugias_set_F <- cirugias_set_a %>% 
+                select(-N_CIE9) %>% 
+                mutate(SEXO = as.numeric(factor(SEXO)),
+                       CIE10 = as.numeric(factor(CIE10)),
+                       masde1 = as.factor(masde1))
+
+```
+
+Ahora se hace la partición de los datos. Se guardará el test_index para usarlo en los otros modelos. 
+
+```{r}
+y <- cirugias_set_F$masde1
+
+test_index <- createDataPartition(y, times = 1, p = 0.2, list = FALSE)
+
+train_set <- cirugias_set_F %>% slice(-test_index)
+test_set <- cirugias_set_F %>% slice(test_index)
+
+## Para verificar que no se incluyen enfermedades en el test_set, que no aparecen en el train_set
+
+test_set <- test_set %>% 
+  semi_join(train_set, by = "EDAD") %>% 
+  semi_join(train_set, by = "CIE10")
+
+```
+
+Se hace el modelo usando un árbol de decisión. 
+
+```{r}
+train_rpart <- train(masde1 ~ .,
+                     method = "rpart",
+                     tuneGrid = data.frame(cp = seq(0.0, 0.1, len = 10)),
+                     data = train_set)
+
+train_rpart
+
+```
+```{r}
+plot(train_rpart)
+```
+El modelo tiene una precisión de poco mas del 93.3% con un parametro de complejidad de 0.111.
+
+Probando el modelo con el test_set, se tiene una precisión del 93.49%. 
+```{r }
+y_hat <- predict(train_rpart, test_set)
+
+confusionMatrix(y_hat, test_set$masde1)
+
+```
+
+Para visualizar como son los resultados.
+
+```{r}
+comparation_models  <- test_set  %>% mutate(d_tree = y_hat)
+
+comparation_models %>% ggplot(aes(masde1, d_tree)) + geom_jitter(col = "blue", alpha = 0.2) +
+  xlab("Real") +
+  ylab("Predicción") +
+  theme_light()
+```
+
+Graficando el árbol de decisión obtenido.
+
+```{r}
+library(rattle)
+
+fancyRpartPlot(train_rpart$finalModel)
+
+```
+
+Ahora se hará un modelo basado en sistemas de recomendación por efectos regularizados.
+
+```{r}
+
+train_set <- cirugias_set_a %>% slice(-test_index)
+test_set <- cirugias_set_a %>% slice(test_index)
+
+test_set <- test_set %>% 
+  semi_join(train_set, by = "EDAD") %>% 
+  semi_join(train_set, by = "CIE10")
+
+
+mu <- mean(train_set$masde1)
+
+lambdas <- seq(0, 10, 0.25)
+
+accuracy <- sapply(lambdas, function(l){
+  
+  b_i <- train_set %>% 
+    group_by(EDAD) %>%
+    summarize(b_i = sum(masde1 - mu)/(n()+l),.groups = "drop")
+  
+  b_s <- train_set %>% 
+    left_join(b_i, by="EDAD") %>%
+    group_by(SEXO) %>%
+    summarize(b_s = sum(masde1 - b_i - mu)/(n()+l),.groups = "drop")
+  
+  b_c <- train_set %>% 
+    left_join(b_i, by="EDAD") %>%
+    left_join(b_s, by="SEXO") %>%
+    group_by(CIE10) %>%
+    summarize(b_c = sum(masde1 - b_i - b_s - mu)/(n()+l),.groups = "drop")
+  
+  predicted_cie9 <- 
+    test_set %>% 
+    left_join(b_i, by = "EDAD") %>%
+    left_join(b_s, by="SEXO") %>%
+    left_join(b_c, by = "CIE10") %>%
+    mutate(pred = mu + b_i + b_s + b_c) %>%
+    pull(pred)
+  
+  return(confusionMatrix(factor(test_set$masde1), factor(round(predicted_cie9)))$overall['Accuracy'])
+  
+})
+
+qplot(lambdas, accuracy)  
+
+```
+
+```{r}
+lambda <- lambdas[which.max(rmses)]
+lambda
+
+```
+
+Ahora haciendo el modelo con el mejor lambda.
+
+```{r}
+b_i <- train_set %>% 
+  group_by(EDAD) %>%
+  summarize(b_i = sum(masde1 - mu)/(n()+lambda),.groups = "drop")
+
+b_s <- train_set %>% 
+  left_join(b_i, by="EDAD") %>%
+  group_by(SEXO) %>%
+  summarize(b_s = sum(masde1 - b_i - mu)/(n()+lambda),.groups = "drop")
+
+b_c <- train_set %>% 
+  left_join(b_i, by="EDAD") %>%
+  left_join(b_s, by="SEXO") %>%
+  group_by(CIE10) %>%
+  summarize(b_c = sum(masde1 - b_i - b_s - mu)/(n()+lambda),.groups = "drop")
+
+predicted <- 
+  test_set %>% 
+  left_join(b_i, by = "EDAD") %>%
+  left_join(b_s, by="SEXO") %>%
+  left_join(b_c, by = "CIE10") %>%
+  mutate(pred = mu + b_i + b_s + b_c) %>%
+  pull(pred)
+
+confusionMatrix(factor(test_set$masde1), factor(round(predicted)))
+
+```
+
+El modelo mejora con una precisión de 93.7%
+
+```{r}
+comparation_models  <- comparation_models %>% mutate(reg_bc = round(predicted))
+
+comparation_models %>% mutate("Comparación" = ifelse(d_tree == reg_bc, "Igual", "Diferente")) %>%
+  ggplot(aes(x = d_tree, y = reg_bc, col = `Comparación`)) + 
+  geom_jitter(alpha = 0.2) +
+  theme_light()
+
+```
+
+Ahora para el número de procedimientos necesarios. 
+
+```{r}
+
+cirugias_set_F <- cirugias_set_a %>% 
+                select(-masde1) %>% 
+                mutate(SEXO = as.numeric(factor(SEXO)),
+                       CIE10 = as.numeric(factor(CIE10))
+                       )
+
+cirugias_set_F <- cirugias_set_F %>% 
+  left_join(CIE10_5mas_f, by="CIE10") %>%
+  mutate(CIE10 = factor) %>%
+  select(-factor)
+
+
+train_set <- cirugias_set_F %>% slice(-test_index)
+test_set <- cirugias_set_F %>% slice(test_index)
+
+test_set <- test_set %>% 
+  semi_join(train_set, by = "EDAD") %>% 
+  semi_join(train_set, by = "CIE10")
+
+train_rpart <- train(N_CIE9 ~ .,
+                     method = "rpart",
+                     tuneGrid = data.frame(cp = seq(0.0, 0.1, len = 10)),
+                     data = train_set)
+
+train_rpart
+
+```
+```{r}
+plot(train_rpart)
+```
+
+```{r}
+plot(train_rpart$finalModel)
+```
+
+```{r}
+y_hat <- predict(train_rpart, test_set)
+
+D_tree_rmse <- RMSE(test_set$N_CIE9, round(y_hat))
+D_tree_rmse
+```
+
+```{r}
+comparation_test <- test_set %>% mutate(prediction = round(y_hat))
+
+comparation_test %>% ggplot(aes(x = N_CIE9, y = prediction)) + 
+  geom_jitter(col = "blue", alpha = 0.5) + 
+  ylab("Predicción") +
+  xlab("Real") +
+  theme_light()
+
+
+```
+
+Probando ahora con un modelo basado en sistemas de recomendacion por efectos regularizados.
+
+```{r}
+
+train_set <- cirugias_set_a %>% slice(-test_index)
+test_set <- cirugias_set_a %>% slice(test_index)
+
+test_set <- test_set %>% 
+  semi_join(train_set, by = "EDAD") %>% 
+  semi_join(train_set, by = "CIE10")
+
+
+mu_n <- mean(train_set$N_CIE9)
+
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+  
+  b_i_n <- train_set %>% 
+    group_by(EDAD) %>%
+    summarize(b_i = sum(N_CIE9 - mu_n)/(n()+l),.groups = "drop")
+  
+  b_s_n <- train_set %>% 
+    left_join(b_i_n, by="EDAD") %>%
+    group_by(SEXO) %>%
+    summarize(b_s = sum(N_CIE9 - b_i - mu_n)/(n()+l),.groups = "drop")
+  
+  b_c_n <- train_set %>% 
+    left_join(b_i_n, by="EDAD") %>%
+    left_join(b_s_n, by="SEXO") %>%
+    group_by(CIE10) %>%
+    summarize(b_c = sum(N_CIE9 - b_i - b_s - mu_n)/(n()+l),.groups = "drop")
+  
+  predicted_cie9 <- test_set %>% 
+    left_join(b_i_n, by = "EDAD") %>%
+    left_join(b_s_n, by="SEXO") %>%
+    left_join(b_c_n, by = "CIE10") %>%
+    mutate(pred = mu_n + b_i + b_s + b_c) %>%
+    pull(pred)
+  
+  return(RMSE(test_set$N_CIE9, round(predicted_cie9)))
+  
+  
+})
+
+qplot(lambdas, rmses)  
+
+
+```
+```{r}
+lambda_n <- lambdas[which.min(rmses)]
+lambda_n
+```
+
+
+```{r}
+min(rmses)
+```
+
+```{r}
+b_i_n <- train_set %>% 
+  group_by(EDAD) %>%
+  summarize(b_i = sum(N_CIE9 - mu_n)/(n()+lambda_n),.groups = "drop")
+
+
+b_s_n <- train_set %>% 
+    left_join(b_i_n, by="EDAD") %>%
+    group_by(SEXO) %>%
+    summarize(b_s = sum(N_CIE9 - b_i - mu_n)/(n()+lambda_n),.groups = "drop")
+
+b_c_n <- train_set %>% 
+  left_join(b_i_n, by="EDAD") %>%
+  left_join(b_s_n, by="SEXO") %>%
+  group_by(CIE10) %>%
+  summarize(b_c = sum(N_CIE9 - b_i - b_s - mu_n)/(n()+lambda_n),.groups = "drop")
+
+predicted_reg <- test_set %>% 
+  left_join(b_i_n, by = "EDAD") %>%
+  left_join(b_s_n, by = "SEXO") %>%
+  left_join(b_c_n, by = "CIE10") %>%
+  mutate(pred = mu_n + b_i + b_s + b_c) %>%
+  pull(pred)
+
+reg_rmse <- RMSE(test_set$N_CIE9, round(predicted_reg))
+reg_rmse
+
+
+
+
+```
+
+```{r}
+comparation_models <- test_set %>% mutate(reg_bc = predicted_reg)
+
+comparation_models %>% ggplot(aes(N_CIE9, round(reg_bc))) + 
+  geom_jitter(col = "blue", alpha = 0.5) + 
+  ylab("Predicción") +
+  xlab("Real") +
+  theme_light() 
+```
+
+
+
+Comparando ambos modelos se puede observar que, de nuevo, el mejor modelo es el de sistemas de recomendacion por efectos regularizados con un RMSE de 0.7796744.
+
+Ahora se guardarán los datos para utilizar el modelo en la aplicación. 
+
+Para decidir si necesita procedimientos:
+
+```{r}
+procedimientos_mdl <- mrEffects(lambda, mu, "masde1", train_set, test_set, rmse = FALSE, cm = TRUE, results = TRUE)
+
+save(procedimientos_mdl, file = "rdas/procedimientos_mdl.rda")
+```
+
+Para determinar el número de procedimientos necesarios:
+
+```{r}
+ncie9_mdl <- mrEffects(lambda_n, mu_n, "N_CIE9", train_set, test_set, rmse = TRUE, cm = FALSE, results = TRUE)
+
+save(ncie9_mdl, file = "rdas/ncie9_mdl.rda")
+```
+
+
+
+
