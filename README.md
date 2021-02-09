@@ -1,0 +1,1 @@
+En este proyecto se realizó una aplicación R shiny que utiliza machine learning para predecir si un paciente necesita o no procedimientos quirúrgicos y cuantos necesita, dependiendo de su edad, sexo y el diagnóstico. También sugiere cuales son los procedimientos a seguir y cuál es la probabilidad de cada procedimiento. 
